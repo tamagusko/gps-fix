@@ -20,6 +20,8 @@ SIGMA_M = 8.0  # GPS noise scale for the emission term
 MAX_CAND_M = 40.0  # candidate edge search radius
 N_CAND = 6  # candidate edges kept per point
 BETA_M = 10.0  # transition tolerance between GPS gap and graph distance
+SPIKE_M = 6.0  # smooth an isolated point this far off its neighbours' line
+DESPIKE_PASSES = 4  # repeat smoothing so multi-point spikes collapse
 NO_PATH_PENALTY = -1e3  # log-score when no on-graph route connects candidates
 TOLERANCE_M = 1.0  # a point counts as "fixed" if it moves more than this
 
@@ -74,22 +76,22 @@ def match_trace(
 
     snapped_x = np.array([candidates[i][c].point.x for i, c in enumerate(chosen)])
     snapped_y = np.array([candidates[i][c].point.y for i, c in enumerate(chosen)])
+    _despike(snapped_x, snapped_y)
     lon, lat = to_wgs84.transform(snapped_x, snapped_y)
     moved_m = np.hypot(snapped_x - xs, snapped_y - ys)
-
-    route_x, route_y = _build_route(proj, candidates, chosen, node_x, node_y)
-    route_lon, route_lat = to_wgs84.transform(route_x, route_y)
 
     fixed = df.copy()
     fixed["lat"] = lat
     fixed["lon"] = lon
+    # The corrected points are continuity-consistent and densely sampled
+    # (1 Hz), so connecting them in time order is one continuous trip path.
     return MatchResult(
         df=fixed,
         moved_m=moved_m,
         fixed_count=int((moved_m > tolerance_m).sum()),
         tolerance_m=tolerance_m,
-        route_lon=np.asarray(route_lon),
-        route_lat=np.asarray(route_lat),
+        route_lon=np.asarray(lon),
+        route_lat=np.asarray(lat),
     )
 
 
@@ -167,27 +169,35 @@ def _viterbi(proj, candidates, xs, ys) -> list[int]:
     return chosen
 
 
-def _build_route(proj, candidates, chosen, node_x, node_y):
-    """Stitch chosen matches into one continuous on-graph polyline."""
-    route_x: list[float] = []
-    route_y: list[float] = []
+def _despike(sx: np.ndarray, sy: np.ndarray) -> None:
+    """Pull out-and-back excursions back onto the local trajectory.
 
-    def push(x: float, y: float) -> None:
-        if not route_x or (route_x[-1] != x or route_y[-1] != y):
-            route_x.append(x)
-            route_y.append(y)
-
-    prev = candidates[0][chosen[0]]
-    push(prev.point.x, prev.point.y)
-    for i in range(1, len(chosen)):
-        cur = candidates[i][chosen[i]]
-        if cur.node != prev.node:
-            try:
-                path = nx.shortest_path(proj, prev.node, cur.node, weight="length")
-                for node in path:
-                    push(node_x[node], node_y[node])
-            except nx.NetworkXNoPath:
-                pass  # gap in graph; the snapped points keep the route going
-        push(cur.point.x, cur.point.y)
-        prev = cur
-    return np.array(route_x), np.array(route_y)
+    An excursion is a short run of points that leaves the path and returns to
+    it: the anchors on either side sit close together while the route through
+    the run is much longer. Each interior point is projected onto the chord
+    between its anchors. The check runs at several half-widths so excursions
+    spanning more than one point collapse, while genuine road curves -- whose
+    route length barely exceeds the chord -- are left untouched. Modifies
+    ``sx``/``sy`` in place.
+    """
+    for half_width in (1, 2):
+        for _ in range(DESPIKE_PASSES):
+            changed = False
+            for i in range(half_width, len(sx) - half_width):
+                ax, ay = sx[i - half_width], sy[i - half_width]
+                bx, by = sx[i + half_width], sy[i + half_width]
+                span = np.hypot(bx - ax, by - ay)
+                if span < 1e-6:
+                    continue
+                legs = np.hypot(sx[i] - ax, sy[i] - ay) + np.hypot(bx - sx[i], by - sy[i])
+                deviation = abs(
+                    (sx[i] - ax) * (by - ay) - (sy[i] - ay) * (bx - ax)
+                ) / span
+                if deviation > SPIKE_M and legs / span > 1.6:
+                    t = ((sx[i] - ax) * (bx - ax) + (sy[i] - ay) * (by - ay)) / span**2
+                    t = min(1.0, max(0.0, t))
+                    sx[i] = ax + t * (bx - ax)
+                    sy[i] = ay + t * (by - ay)
+                    changed = True
+            if not changed:
+                break

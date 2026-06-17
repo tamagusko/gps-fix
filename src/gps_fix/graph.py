@@ -5,6 +5,22 @@ import osmnx as ox
 import pandas as pd
 
 BUFFER_DEG = 0.002  # ~200 m padding around the trace bounding box
+PRUNE_PASSES = 2  # iterations of dead-end stub removal
+
+
+def _prune_dead_ends(graph: nx.MultiDiGraph) -> None:
+    """Remove dead-end stub nodes so points cannot snap onto them.
+
+    Short dangling stubs (degree-1 nodes) capture points near a junction and
+    pull the route off the through-road. Removing them repeatedly also clears
+    the new stubs each pass exposes. Modifies ``graph`` in place.
+    """
+    for _ in range(PRUNE_PASSES):
+        undirected = graph.to_undirected()
+        dead_ends = [n for n in graph.nodes if undirected.degree(n) <= 1]
+        if not dead_ends:
+            break
+        graph.remove_nodes_from(dead_ends)
 
 
 def build_graph(df: pd.DataFrame, network_type: str = "all") -> nx.MultiDiGraph:
@@ -34,4 +50,8 @@ def build_graph(df: pd.DataFrame, network_type: str = "all") -> nx.MultiDiGraph:
 
     if graph.number_of_edges() == 0:
         raise ValueError("Road graph has no edges for the trace area.")
+
+    _prune_dead_ends(graph)
+    if graph.number_of_edges() == 0:
+        raise ValueError("Road graph has no through-roads for the trace area.")
     return graph
