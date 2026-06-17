@@ -22,6 +22,7 @@ N_CAND = 6  # candidate edges kept per point
 BETA_M = 10.0  # transition tolerance between GPS gap and graph distance
 SPIKE_M = 6.0  # smooth an isolated point this far off its neighbours' line
 DESPIKE_PASSES = 4  # repeat smoothing so multi-point spikes collapse
+STATIONARY_M = 3.0  # cluster points within this radius as one stop (no motion)
 NO_PATH_PENALTY = -1e3  # log-score when no on-graph route connects candidates
 TOLERANCE_M = 1.0  # a point counts as "fixed" if it moves more than this
 
@@ -71,28 +72,55 @@ def match_trace(
     node_y = nx.get_node_attributes(proj, "y")
     edge_geoms = ox.graph_to_gdfs(proj, nodes=False)["geometry"]
 
-    candidates = _candidates(edge_geoms, xs, ys, node_x, node_y)
-    chosen = _viterbi(proj, candidates, xs, ys)
+    # Collapse stationary clusters (stops/jitter) to one representative point so
+    # they match once instead of scattering across nearby edges.
+    groups = _stationary_groups(xs, ys)
+    gx = np.array([xs[groups == g].mean() for g in range(groups.max() + 1)])
+    gy = np.array([ys[groups == g].mean() for g in range(groups.max() + 1)])
 
-    snapped_x = np.array([candidates[i][c].point.x for i, c in enumerate(chosen)])
-    snapped_y = np.array([candidates[i][c].point.y for i, c in enumerate(chosen)])
-    _despike(snapped_x, snapped_y)
+    candidates = _candidates(edge_geoms, gx, gy, node_x, node_y)
+    chosen = _viterbi(proj, candidates, gx, gy)
+
+    rep_x = np.array([candidates[g][c].point.x for g, c in enumerate(chosen)])
+    rep_y = np.array([candidates[g][c].point.y for g, c in enumerate(chosen)])
+    _despike(rep_x, rep_y)
+
+    snapped_x = rep_x[groups]  # expand representatives back to every point
+    snapped_y = rep_y[groups]
     lon, lat = to_wgs84.transform(snapped_x, snapped_y)
     moved_m = np.hypot(snapped_x - xs, snapped_y - ys)
 
     fixed = df.copy()
     fixed["lat"] = lat
     fixed["lon"] = lon
-    # The corrected points are continuity-consistent and densely sampled
-    # (1 Hz), so connecting them in time order is one continuous trip path.
+    # The representatives are continuity-consistent and densely sampled (1 Hz),
+    # so connecting them in order is one continuous trip path.
+    route_lon, route_lat = to_wgs84.transform(rep_x, rep_y)
     return MatchResult(
         df=fixed,
         moved_m=moved_m,
         fixed_count=int((moved_m > tolerance_m).sum()),
         tolerance_m=tolerance_m,
-        route_lon=np.asarray(lon),
-        route_lat=np.asarray(lat),
+        route_lon=np.asarray(route_lon),
+        route_lat=np.asarray(route_lat),
     )
+
+
+def _stationary_groups(xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
+    """Group consecutive points that stay within ``STATIONARY_M`` of an anchor.
+
+    Returns an array of group ids (one per point). A new group starts whenever
+    a point moves beyond the threshold from the current group's anchor, so
+    stops and GPS jitter collapse into a single representative.
+    """
+    groups = np.zeros(len(xs), dtype=int)
+    anchor_x, anchor_y, gid = xs[0], ys[0], 0
+    for i in range(1, len(xs)):
+        if np.hypot(xs[i] - anchor_x, ys[i] - anchor_y) > STATIONARY_M:
+            gid += 1
+            anchor_x, anchor_y = xs[i], ys[i]
+        groups[i] = gid
+    return groups
 
 
 @dataclass(frozen=True)

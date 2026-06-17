@@ -53,11 +53,17 @@ timestamps) are preserved in the output.
 2. Build a routable OSM graph for the trace bounding box plus a buffer and
    prune dead-end stubs that would otherwise capture points near junctions
    (`graph.py`, `network_type="all"`).
-3. Project the graph to a metric CRS, score candidate edges per point, and run
-   a Viterbi HMM to choose a continuous edge sequence; snap each point to its
+3. Collapse stationary clusters (stops/jitter) to one representative, project
+   the graph to a metric CRS, score candidate edges per point, and run a
+   Viterbi HMM to choose a continuous edge sequence; snap each point to its
    chosen edge and smooth any residual out-and-back spikes (`matching.py`).
 4. Save the corrected CSV, two comparable PNGs, and the report
    (`plotting.py`, `report.py`).
+
+The HMM follows the Newson & Krumm (2009) formulation, with preprocessing
+ideas (stationary-point removal) inspired by NREL's
+[mappymatch](https://github.com/NREL/mappymatch) and
+[leuvenmapmatching](https://github.com/wannesm/LeuvenMapMatching).
 
 ## License
 
