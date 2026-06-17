@@ -32,10 +32,15 @@ pip install -r requirements.txt
 ## Run
 
 ```bash
-PYTHONPATH=src python -m gps_fix
+python main.py
 ```
 
-Runs end to end with no arguments, reading `data/gps.csv` and writing `outputs/`.
+Runs the whole pipeline on `data/gps.csv`, writes `outputs/`, and opens the
+raw and corrected maps. To run without opening the maps:
+
+```bash
+PYTHONPATH=src python -m gps_fix
+```
 
 ## Input
 
