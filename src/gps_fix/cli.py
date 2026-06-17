@@ -29,9 +29,22 @@ def main() -> int:
 
         result = match_trace(graph, df_raw)
         save_gps(result.df, OUTPUT_DIR / "gps_fixed.csv")
-        plot_route(graph, df_raw, "Raw GPS route", OUTPUT_DIR / "raw_route.png", "red")
         plot_route(
-            graph, result.df, "Corrected route", OUTPUT_DIR / "fixed_route.png", "green"
+            graph,
+            df_raw["lon"],
+            df_raw["lat"],
+            "Raw GPS route",
+            OUTPUT_DIR / "raw_route.png",
+            "red",
+        )
+        plot_route(
+            graph,
+            result.route_lon,
+            result.route_lat,
+            "Corrected route",
+            OUTPUT_DIR / "fixed_route.png",
+            "green",
+            markers=(result.df["lon"], result.df["lat"]),
         )
         headline = write_report(result, OUTPUT_DIR / "report.md")
     except (FileNotFoundError, ValueError) as exc:

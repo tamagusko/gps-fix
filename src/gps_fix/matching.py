@@ -1,4 +1,11 @@
-"""Map-match GPS points by projecting them onto the nearest road edge."""
+"""Map-match a GPS trace with an HMM, keeping the route continuous.
+
+Each point keeps several candidate edges. A Viterbi pass picks the edge
+sequence that balances closeness to the raw point (emission) against agreement
+between consecutive-point spacing and on-graph travel distance (transition).
+Because 1 Hz points are metres apart, this keeps a point on the through-road at
+an intersection instead of letting it jump onto the crossing road.
+"""
 
 from dataclasses import dataclass
 
@@ -7,8 +14,13 @@ import numpy as np
 import osmnx as ox
 import pandas as pd
 from pyproj import Transformer
-from shapely.geometry import LineString, Point
+from shapely.geometry import Point
 
+SIGMA_M = 8.0  # GPS noise scale for the emission term
+MAX_CAND_M = 40.0  # candidate edge search radius
+N_CAND = 6  # candidate edges kept per point
+BETA_M = 10.0  # transition tolerance between GPS gap and graph distance
+NO_PATH_PENALTY = -1e3  # log-score when no on-graph route connects candidates
 TOLERANCE_M = 1.0  # a point counts as "fixed" if it moves more than this
 
 
@@ -21,44 +33,31 @@ class MatchResult:
         moved_m: Per-point displacement from raw to snapped, in metres.
         fixed_count: Number of points moved beyond the tolerance.
         tolerance_m: Displacement threshold used to flag a point as fixed.
+        route_lon: Longitudes of the continuous on-graph route.
+        route_lat: Latitudes of the continuous on-graph route.
     """
 
     df: pd.DataFrame
     moved_m: np.ndarray
     fixed_count: int
     tolerance_m: float
-
-
-def _edge_geometry(graph: nx.MultiDiGraph, u: int, v: int, k: int) -> LineString:
-    """Return the geometry of edge ``(u, v, k)`` in the graph's CRS."""
-    data = graph.edges[u, v, k]
-    if "geometry" in data:
-        return data["geometry"]
-    return LineString(
-        [
-            (graph.nodes[u]["x"], graph.nodes[u]["y"]),
-            (graph.nodes[v]["x"], graph.nodes[v]["y"]),
-        ]
-    )
+    route_lon: np.ndarray
+    route_lat: np.ndarray
 
 
 def match_trace(
     graph: nx.MultiDiGraph, df: pd.DataFrame, tolerance_m: float = TOLERANCE_M
 ) -> MatchResult:
-    """Snap each GPS point onto the closest road edge.
-
-    The graph is projected to a metric CRS, each point is projected onto the
-    geometry of its nearest edge, and the snapped position is converted back to
-    WGS84. This keeps drifted points on real streets rather than the noisy raw
-    location, while preserving the trace's order and one output row per input.
+    """Map-match the trace and build a continuous corrected route.
 
     Args:
         graph: Routable OSM graph in WGS84.
-        df: GPS points with ``lat`` and ``lon`` columns.
+        df: GPS points with ``lat`` and ``lon`` columns, in time order.
         tolerance_m: Minimum displacement (metres) to flag a point as fixed.
 
     Returns:
-        A :class:`MatchResult` with the corrected trace and statistics.
+        A :class:`MatchResult` with the corrected per-point trace, the
+        continuous route geometry, and statistics.
     """
     proj = ox.project_graph(graph)
     crs = proj.graph["crs"]
@@ -66,18 +65,20 @@ def match_trace(
     to_wgs84 = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
 
     xs, ys = to_metric.transform(df["lon"].to_numpy(), df["lat"].to_numpy())
-    edges = ox.distance.nearest_edges(proj, xs, ys)
+    node_x = nx.get_node_attributes(proj, "x")
+    node_y = nx.get_node_attributes(proj, "y")
+    edge_geoms = ox.graph_to_gdfs(proj, nodes=False)["geometry"]
 
-    snapped_x = np.empty(len(df))
-    snapped_y = np.empty(len(df))
-    for i, (x, y, edge) in enumerate(zip(xs, ys, edges)):
-        geom = _edge_geometry(proj, *edge)
-        point = geom.interpolate(geom.project(Point(x, y)))
-        snapped_x[i] = point.x
-        snapped_y[i] = point.y
+    candidates = _candidates(edge_geoms, xs, ys, node_x, node_y)
+    chosen = _viterbi(proj, candidates, xs, ys)
 
+    snapped_x = np.array([candidates[i][c].point.x for i, c in enumerate(chosen)])
+    snapped_y = np.array([candidates[i][c].point.y for i, c in enumerate(chosen)])
     lon, lat = to_wgs84.transform(snapped_x, snapped_y)
     moved_m = np.hypot(snapped_x - xs, snapped_y - ys)
+
+    route_x, route_y = _build_route(proj, candidates, chosen, node_x, node_y)
+    route_lon, route_lat = to_wgs84.transform(route_x, route_y)
 
     fixed = df.copy()
     fixed["lat"] = lat
@@ -87,4 +88,106 @@ def match_trace(
         moved_m=moved_m,
         fixed_count=int((moved_m > tolerance_m).sum()),
         tolerance_m=tolerance_m,
+        route_lon=np.asarray(route_lon),
+        route_lat=np.asarray(route_lat),
     )
+
+
+@dataclass(frozen=True)
+class _Candidate:
+    """A candidate edge match for one GPS point (projected CRS)."""
+
+    point: Point  # raw point projected onto the edge
+    dist: float  # distance from raw point to the edge, metres
+    node: int  # edge endpoint used for on-graph routing
+
+
+def _candidates(edge_geoms, xs, ys, node_x, node_y) -> list[list[_Candidate]]:
+    """Find up to ``N_CAND`` nearby edges for each point, nearest first."""
+    geoms = edge_geoms.to_numpy()
+    index = edge_geoms.index.to_list()
+    out: list[list[_Candidate]] = []
+    for x, y in zip(xs, ys):
+        raw = Point(x, y)
+        dists = np.array([g.distance(raw) for g in geoms])
+        cands: list[_Candidate] = []
+        for idx in np.argsort(dists)[:N_CAND]:
+            dist = float(dists[idx])
+            if dist > MAX_CAND_M and cands:
+                break  # always keep at least the nearest edge
+            geom = geoms[idx]
+            point = geom.interpolate(geom.project(raw))
+            u, v = index[idx][0], index[idx][1]
+            du = (node_x[u] - point.x) ** 2 + (node_y[u] - point.y) ** 2
+            dv = (node_x[v] - point.x) ** 2 + (node_y[v] - point.y) ** 2
+            cands.append(_Candidate(point=point, dist=dist, node=u if du <= dv else v))
+        out.append(cands)
+    return out
+
+
+def _viterbi(proj, candidates, xs, ys) -> list[int]:
+    """Pick the most likely candidate per point via the Viterbi algorithm."""
+    cache: dict[tuple[int, int], float] = {}
+
+    def route_len(a: int, b: int) -> float | None:
+        if a == b:
+            return 0.0
+        if (a, b) not in cache:
+            try:
+                cache[a, b] = nx.shortest_path_length(proj, a, b, weight="length")
+            except nx.NetworkXNoPath:
+                cache[a, b] = None
+        return cache[a, b]
+
+    n = len(candidates)
+    scores = [[-0.5 * (c.dist / SIGMA_M) ** 2 for c in candidates[0]]]
+    back: list[list[int]] = [[-1] * len(candidates[0])]
+    for i in range(1, n):
+        gap = float(np.hypot(xs[i] - xs[i - 1], ys[i] - ys[i - 1]))
+        prev = scores[i - 1]
+        row, row_back = [], []
+        for cand in candidates[i]:
+            emission = -0.5 * (cand.dist / SIGMA_M) ** 2
+            best, best_k = float("-inf"), 0
+            for k, pcand in enumerate(candidates[i - 1]):
+                rl = route_len(pcand.node, cand.node)
+                trans = NO_PATH_PENALTY if rl is None else -abs(gap - rl) / BETA_M
+                total = prev[k] + trans
+                if total > best:
+                    best, best_k = total, k
+            row.append(best + emission)
+            row_back.append(best_k)
+        scores.append(row)
+        back.append(row_back)
+
+    chosen = [int(np.argmax(scores[-1]))]
+    for i in range(n - 1, 0, -1):
+        chosen.append(back[i][chosen[-1]])
+    chosen.reverse()
+    return chosen
+
+
+def _build_route(proj, candidates, chosen, node_x, node_y):
+    """Stitch chosen matches into one continuous on-graph polyline."""
+    route_x: list[float] = []
+    route_y: list[float] = []
+
+    def push(x: float, y: float) -> None:
+        if not route_x or (route_x[-1] != x or route_y[-1] != y):
+            route_x.append(x)
+            route_y.append(y)
+
+    prev = candidates[0][chosen[0]]
+    push(prev.point.x, prev.point.y)
+    for i in range(1, len(chosen)):
+        cur = candidates[i][chosen[i]]
+        if cur.node != prev.node:
+            try:
+                path = nx.shortest_path(proj, prev.node, cur.node, weight="length")
+                for node in path:
+                    push(node_x[node], node_y[node])
+            except nx.NetworkXNoPath:
+                pass  # gap in graph; the snapped points keep the route going
+        push(cur.point.x, cur.point.y)
+        prev = cur
+    return np.array(route_x), np.array(route_y)
