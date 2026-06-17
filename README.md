@@ -58,3 +58,7 @@ timestamps) are preserved in the output.
    chosen edge and smooth any residual out-and-back spikes (`matching.py`).
 4. Save the corrected CSV, two comparable PNGs, and the report
    (`plotting.py`, `report.py`).
+
+## License
+
+MIT — see [LICENSE](LICENSE).
